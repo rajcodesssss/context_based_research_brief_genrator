@@ -1,0 +1,39 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# ---- Virtual environment ----
+venv/
+.env
+.env.*.local
+
+# ---- Databases & storage ----
+*.db
+*.sqlite3
+
+# ---- Logs ----
+*.log
+
+# ---- OS / Editor junk ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Test / Debug ----
+.coverage
+.pytest_cache/
+htmlcov/
+
+# ---- Results / Generated files ----
+result/
+results/
+*.out
+*.tmp
+
+# ---- Custom ----
+user_history.db
+user_profile.txt
