@@ -75,6 +75,10 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan
 )
+@app.get("/")
+def root():
+    return {"message": "Welcome to the Context-Aware Research Brief API! Go to /docs for the API docs."}
+
 
 # Add CORS middleware
 app.add_middleware(
