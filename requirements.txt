@@ -87,3 +87,4 @@ uvicorn==0.35.0
 xxhash==3.5.0
 yarl==1.20.1
 zstandard==0.24.0
+langsmith>=0.1.0
