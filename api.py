@@ -11,9 +11,8 @@ import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-# LangSmith imports
-from langsmith import Client, traceable
-from langchain.callbacks import LangChainTracer
+# LangSmith imports - Fixed
+from langsmith import Client, traceable, get_current_run_tree
 
 # Import your existing modules
 from graphs import graph
@@ -24,20 +23,58 @@ from main import convert_to_json_serializable, ensure_session_metadata
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize LangSmith
+# Initialize LangSmith with proper error handling
 def init_langsmith():
-    """Initialize LangSmith tracing"""
+    """Initialize LangSmith tracing with comprehensive validation"""
     try:
-        # Set environment variables for LangSmith
+        # Check required environment variables
+        api_key = os.getenv("LANGCHAIN_API_KEY")
+        project = os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT")
+        endpoint = os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+        
+        if not api_key:
+            logger.warning("❌ LANGCHAIN_API_KEY not found in environment")
+            return None
+        
+        if not project:
+            logger.warning("❌ Neither LANGCHAIN_PROJECT nor LANGSMITH_PROJECT found")
+            return None
+        
+        # Set required environment variables
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        # LANGCHAIN_API_KEY and LANGCHAIN_PROJECT should be set in Render environment
+        os.environ["LANGCHAIN_PROJECT"] = project
+        os.environ["LANGCHAIN_ENDPOINT"] = endpoint
+        os.environ["LANGCHAIN_API_KEY"] = api_key
         
         # Initialize LangSmith client
-        langsmith_client = Client()
-        logger.info("✅ LangSmith initialized successfully")
-        return langsmith_client
+        langsmith_client = Client(
+            api_key=api_key,
+            api_url=endpoint
+        )
+        
+        # Test connection
+        try:
+            projects = list(langsmith_client.list_projects(limit=1))
+            logger.info(f"✅ LangSmith initialized successfully - Project: {project}")
+            return langsmith_client
+        except Exception as test_error:
+            logger.error(f"❌ LangSmith connection test failed: {test_error}")
+            return langsmith_client  # Return client anyway, might work for tracing
+            
     except Exception as e:
         logger.warning(f"⚠️ LangSmith initialization failed: {e}")
+        return None
+
+def get_trace_url() -> Optional[str]:
+    """Get the current trace URL properly"""
+    try:
+        current_run = get_current_run_tree()
+        if current_run and hasattr(current_run, 'id'):
+            project = os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT", "default")
+            return f"https://smith.langchain.com/projects/{project}/runs/{current_run.id}"
+        return None
+    except Exception as e:
+        logger.debug(f"Could not get trace URL: {e}")
         return None
 
 # Pydantic models for API requests/responses
@@ -76,6 +113,7 @@ class HealthResponse(BaseModel):
     timestamp: str
     version: str = "1.0.0"
     langsmith_enabled: bool = False
+    langsmith_details: Optional[Dict[str, Any]] = None
 
 class MetricsResponse(BaseModel):
     """Simple metrics endpoint for monitoring"""
@@ -94,12 +132,26 @@ metrics = {
     "langsmith_traces": 0
 }
 
-@traceable(name="research_graph_execution")
+@traceable(name="research_graph_execution", tags=["graph", "research"])
 def execute_research_graph(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Traced wrapper for graph execution"""
+    """Traced wrapper for graph execution with proper metadata"""
     global compiled_graph, metrics
     
     start_time = time.time()
+    
+    # Add trace metadata
+    current_run = get_current_run_tree()
+    if current_run:
+        current_run.update(
+            metadata={
+                "topic": state.get("topic", "unknown"),
+                "depth": state.get("depth", 1),
+                "audience": state.get("audience", "general"),
+                "is_follow_up": state.get("follow_up", False),
+                "session_id": state.get("session_id"),
+            }
+        )
+        current_run.add_tags(["execution", "core"])
     
     try:
         # Execute the research graph
@@ -111,22 +163,67 @@ def execute_research_graph(state: Dict[str, Any]) -> Dict[str, Any]:
         # Update metrics
         metrics["total_execution_time"] += execution_time
         metrics["successful_requests"] += 1
-        metrics["langsmith_traces"] += 1
+        if langsmith_client:
+            metrics["langsmith_traces"] += 1
         
         logger.info(f"✅ Graph execution completed in {execution_time:.2f}s")
         
         # Add execution metadata
         if isinstance(final_state, dict):
             final_state["execution_time_seconds"] = execution_time
+            final_state["langsmith_traced"] = langsmith_client is not None
         else:
             setattr(final_state, "execution_time_seconds", execution_time)
+            setattr(final_state, "langsmith_traced", langsmith_client is not None)
         
         return final_state
         
     except Exception as e:
         execution_time = time.time() - start_time
         logger.error(f"❌ Graph execution failed after {execution_time:.2f}s: {e}")
+        
+        # Add error info to trace
+        if current_run:
+            current_run.update(
+                metadata={
+                    "error": str(e),
+                    "execution_time": execution_time,
+                    "status": "failed"
+                }
+            )
+            current_run.add_tags(["error"])
+        
         raise
+
+def get_langsmith_health() -> Dict[str, Any]:
+    """Get detailed LangSmith health information"""
+    global langsmith_client
+    
+    health_info = {
+        "enabled": langsmith_client is not None,
+        "client_initialized": langsmith_client is not None,
+        "environment_vars": {
+            "LANGCHAIN_API_KEY": "***SET***" if os.getenv("LANGCHAIN_API_KEY") else "❌ MISSING",
+            "LANGCHAIN_PROJECT": os.getenv("LANGCHAIN_PROJECT") or "❌ MISSING",
+            "LANGSMITH_PROJECT": os.getenv("LANGSMITH_PROJECT") or "❌ MISSING",
+            "LANGCHAIN_ENDPOINT": os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com"),
+            "LANGCHAIN_TRACING_V2": os.getenv("LANGCHAIN_TRACING_V2", "false")
+        },
+        "project_name": os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT") or "unknown"
+    }
+    
+    # Test connection if client exists
+    if langsmith_client:
+        try:
+            projects = list(langsmith_client.list_projects(limit=1))
+            health_info["connection_test"] = "✅ Success"
+            health_info["projects_accessible"] = len(projects)
+        except Exception as e:
+            health_info["connection_test"] = f"❌ Failed: {str(e)}"
+    else:
+        health_info["connection_test"] = "❌ No client available"
+    
+    return health_info
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -135,11 +232,23 @@ async def lifespan(app: FastAPI):
     
     try:
         # Initialize LangSmith first
+        print("🔄 Initializing LangSmith...")
         langsmith_client = init_langsmith()
+        
+        if langsmith_client:
+            print("✅ LangSmith initialized successfully")
+        else:
+            print("⚠️ LangSmith initialization failed - continuing without tracing")
         
         print("🚀 Compiling research graph...")
         compiled_graph = graph.compile()
         print("✅ Graph compiled successfully!")
+        
+        # Print startup summary
+        health = get_langsmith_health()
+        print("📊 Startup Summary:")
+        print(f"  LangSmith: {'✅ Enabled' if health['enabled'] else '❌ Disabled'}")
+        print(f"  Project: {health['project_name']}")
         
     except Exception as e:
         print(f"❌ Failed to compile graph: {e}")
@@ -177,13 +286,16 @@ app.add_middleware(
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint with LangSmith status"""
+    """Health check endpoint with detailed LangSmith status"""
     global langsmith_client
+    
+    langsmith_details = get_langsmith_health()
     
     return HealthResponse(
         status="healthy",
         timestamp=datetime.now().isoformat(),
-        langsmith_enabled=langsmith_client is not None
+        langsmith_enabled=langsmith_client is not None,
+        langsmith_details=langsmith_details
     )
 
 @app.get("/metrics", response_model=MetricsResponse)
@@ -208,7 +320,7 @@ async def get_metrics():
         langsmith_traces=metrics["langsmith_traces"]
     )
 
-@traceable(name="generate_research_brief_api")
+@traceable(name="generate_research_brief_api", tags=["api", "research_brief"])
 @app.post("/brief", response_model=ResearchBriefResponse)
 async def generate_research_brief(request: ResearchBriefRequest):
     """
@@ -230,12 +342,28 @@ async def generate_research_brief(request: ResearchBriefRequest):
         raise HTTPException(status_code=503, detail="Research graph not initialized")
     
     api_start_time = time.time()
-    trace_url = None
     
     try:
         # Generate IDs
         session_id = str(uuid.uuid4())
         user_id = request.user_id or str(uuid.uuid4())
+        
+        # Set trace metadata at API level
+        current_run = get_current_run_tree()
+        if current_run:
+            current_run.update(
+                name=f"Research: {request.topic[:50]}...",
+                metadata={
+                    "api_endpoint": "/brief",
+                    "topic": request.topic,
+                    "depth": request.depth,
+                    "audience": request.audience,
+                    "follow_up": request.follow_up,
+                    "session_id": session_id,
+                    "user_id": user_id[:8] + "..." if user_id else "unknown"
+                }
+            )
+            current_run.add_tags(["api", "research"])
         
         logger.info(f"🎯 Starting research brief generation - Topic: {request.topic}, User: {user_id[:8]}...")
         
@@ -303,13 +431,21 @@ async def generate_research_brief(request: ResearchBriefRequest):
         total_execution_time = time.time() - api_start_time
         graph_execution_time = final_state.get('execution_time_seconds') if isinstance(final_state, dict) else getattr(final_state, 'execution_time_seconds', None)
         
-        # Generate trace URL if LangSmith is available
-        if langsmith_client:
-            try:
-                # This is a placeholder - actual trace URL generation depends on LangSmith implementation
-                trace_url = f"https://smith.langchain.com/projects/{os.getenv('LANGCHAIN_PROJECT', 'research-brief-production')}"
-            except Exception as e:
-                logger.warning(f"Could not generate trace URL: {e}")
+        # Generate trace URL properly
+        trace_url = get_trace_url()
+        
+        # Add final metadata to trace
+        if current_run:
+            current_run.update(
+                metadata={
+                    "total_execution_time": total_execution_time,
+                    "graph_execution_time": graph_execution_time,
+                    "status": "success",
+                    "brief_sections": len(brief_json.get('sections', [])) if isinstance(brief_json, dict) else 0,
+                    "references_count": len(brief_json.get('references', [])) if isinstance(brief_json, dict) else 0
+                }
+            )
+            current_run.add_tags(["completed", "success"])
         
         # Build response
         response = ResearchBriefResponse(
@@ -336,8 +472,60 @@ async def generate_research_brief(request: ResearchBriefRequest):
         
     except Exception as e:
         total_execution_time = time.time() - api_start_time
+        
+        # Add error metadata to trace
+        current_run = get_current_run_tree()
+        if current_run:
+            current_run.update(
+                metadata={
+                    "error": str(e),
+                    "total_execution_time": total_execution_time,
+                    "status": "failed"
+                }
+            )
+            current_run.add_tags(["error", "failed"])
+        
         logger.error(f"❌ Research brief failed after {total_execution_time:.2f}s - Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate research brief: {str(e)}")
+
+# Add LangSmith testing endpoints
+@app.get("/test/langsmith/quick")
+async def test_langsmith_quick():
+    """Quick LangSmith test endpoint"""
+    global langsmith_client
+    
+    if not langsmith_client:
+        return {
+            "langsmith_working": False,
+            "message": "LangSmith client not initialized",
+            "health": get_langsmith_health()
+        }
+    
+    try:
+        @traceable(name="quick_test", tags=["test", "health_check"])
+        def quick_test():
+            return {
+                "status": "working",
+                "timestamp": datetime.now().isoformat(),
+                "test_id": str(uuid.uuid4())
+            }
+        
+        result = quick_test()
+        trace_url = get_trace_url()
+        
+        return {
+            "langsmith_working": True,
+            "test_result": result,
+            "trace_url": trace_url,
+            "message": "LangSmith is working correctly"
+        }
+        
+    except Exception as e:
+        return {
+            "langsmith_working": False,
+            "error": str(e),
+            "message": "LangSmith test failed"
+        }
 
 @app.get("/users/{user_id}/history", response_model=UserHistoryResponse)
 async def get_user_history(user_id: str, limit: int = 10):
