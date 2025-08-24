@@ -1,8 +1,10 @@
+# Fixed api.py with proper error handling and state management
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import uuid
 import json
 import os
@@ -11,151 +13,164 @@ import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-# LangSmith imports - Fixed
-from langsmith import Client, traceable, get_current_run_tree
+# LangSmith imports with error handling
+try:
+    from langsmith import Client, traceable, get_current_run_tree
+    LANGSMITH_AVAILABLE = True
+except ImportError:
+    LANGSMITH_AVAILABLE = False
+    traceable = lambda *args, **kwargs: lambda f: f  # Mock decorator
+    get_current_run_tree = lambda: None
 
-# Import your existing modules
-from graphs import graph
-from models import get_history_store, ResearchRequest
-from main import convert_to_json_serializable, ensure_session_metadata
+# Import your graph (using the fixed version)
+from graphs import graph, initialize_state
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize LangSmith with proper error handling
+# ==========================
+# LangSmith initialization with robust error handling
+# ==========================
 def init_langsmith():
-    """Initialize LangSmith tracing with comprehensive validation"""
+    """Initialize LangSmith with comprehensive error handling"""
+    if not LANGSMITH_AVAILABLE:
+        logger.warning("LangSmith not available - install langsmith package for tracing")
+        return None
+    
     try:
-        # Check required environment variables
         api_key = os.getenv("LANGCHAIN_API_KEY")
         project = os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT")
         endpoint = os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
         
-        if not api_key:
-            logger.warning("❌ LANGCHAIN_API_KEY not found in environment")
+        if not api_key or not project:
+            logger.warning(f"LangSmith config incomplete - API Key: {bool(api_key)}, Project: {bool(project)}")
             return None
         
-        if not project:
-            logger.warning("❌ Neither LANGCHAIN_PROJECT nor LANGSMITH_PROJECT found")
-            return None
-        
-        # Set required environment variables
+        # Set environment variables
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_PROJECT"] = project
         os.environ["LANGCHAIN_ENDPOINT"] = endpoint
         os.environ["LANGCHAIN_API_KEY"] = api_key
         
-        # Initialize LangSmith client
-        langsmith_client = Client(
-            api_key=api_key,
-            api_url=endpoint
-        )
+        client = Client(api_key=api_key, api_url=endpoint)
         
         # Test connection
-        try:
-            projects = list(langsmith_client.list_projects(limit=1))
-            logger.info(f"✅ LangSmith initialized successfully - Project: {project}")
-            return langsmith_client
-        except Exception as test_error:
-            logger.error(f"❌ LangSmith connection test failed: {test_error}")
-            return langsmith_client  # Return client anyway, might work for tracing
-            
+        list(client.list_projects(limit=1))
+        logger.info(f"LangSmith initialized - Project: {project}")
+        return client
+        
     except Exception as e:
-        logger.warning(f"⚠️ LangSmith initialization failed: {e}")
+        logger.warning(f"LangSmith initialization failed: {e}")
         return None
 
 def get_trace_url() -> Optional[str]:
-    """Get the current trace URL properly"""
+    """Safely get trace URL"""
+    if not LANGSMITH_AVAILABLE:
+        return None
+    
     try:
         current_run = get_current_run_tree()
         if current_run and hasattr(current_run, 'id'):
             project = os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT", "default")
             return f"https://smith.langchain.com/projects/{project}/runs/{current_run.id}"
-        return None
-    except Exception as e:
-        logger.debug(f"Could not get trace URL: {e}")
-        return None
+    except Exception:
+        pass
+    return None
 
-# Pydantic models for API requests/responses
+# ==========================
+# Pydantic models
+# ==========================
 class ResearchBriefRequest(BaseModel):
-    topic: str = Field(..., description="Research topic", example="AI in Healthcare")
-    depth: int = Field(default=2, ge=1, le=5, description="Research depth level (1-5)")
-    audience: str = Field(default="general", description="Target audience", example="general")
-    follow_up: bool = Field(default=False, description="Is this a follow-up to previous research?")
-    user_id: Optional[str] = Field(None, description="User ID for context (auto-generated if not provided)")
-    parent_session_id: Optional[str] = Field(None, description="Parent session ID for follow-up research")
+    topic: str = Field(..., description="Research topic", min_length=3, max_length=200)
+    depth: int = Field(default=2, ge=1, le=5, description="Research depth (1-5)")
+    audience: str = Field(default="general", description="Target audience")
+    follow_up: bool = Field(default=False, description="Follow-up research?")
+    user_id: Optional[str] = Field(None, description="User ID")
+    parent_session_id: Optional[str] = Field(None, description="Parent session ID")
 
 class ResearchBriefResponse(BaseModel):
-    session_id: str = Field(..., description="Unique session identifier")
-    topic: str = Field(..., description="Research topic")
-    audience: str = Field(..., description="Target audience")
-    depth: int = Field(..., description="Research depth level")
-    is_follow_up: bool = Field(..., description="Whether this was follow-up research")
-    thesis: Optional[str] = Field(None, description="Main thesis statement")
-    sections: List[Dict[str, Any]] = Field(default=[], description="Research sections")
-    references: List[Dict[str, Any]] = Field(default=[], description="Source references")
-    context_summary: Optional[Dict[str, Any]] = Field(None, description="Context from previous research (if follow-up)")
-    created_at: str = Field(..., description="Creation timestamp")
-    user_id: str = Field(..., description="User ID")
-    parent_session_id: Optional[str] = Field(None, description="Parent session ID")
-    # Add observability fields
-    execution_time_seconds: Optional[float] = Field(None, description="Total execution time")
-    trace_url: Optional[str] = Field(None, description="LangSmith trace URL")
-
-class UserHistoryResponse(BaseModel):
+    # Session info
+    session_id: str
+    topic: str
+    audience: str
+    depth: int
+    is_follow_up: bool
     user_id: str
-    sessions: List[Dict[str, Any]]
-    total_count: int
+    parent_session_id: Optional[str] = None
+    
+    # Brief content
+    thesis: Optional[str] = None
+    sections: List[Dict[str, Any]] = Field(default_factory=list)
+    references: List[Dict[str, Any]] = Field(default_factory=list)
+    
+    # Metadata
+    context_summary: Optional[Dict[str, Any]] = None
+    created_at: str
+    execution_status: str
+    
+    # Observability
+    execution_time_seconds: Optional[float] = None
+    total_tokens_used: Optional[int] = None
+    errors: List[str] = Field(default_factory=list)
+    trace_url: Optional[str] = None
 
 class HealthResponse(BaseModel):
     status: str = "healthy"
     timestamp: str
     version: str = "1.0.0"
     langsmith_enabled: bool = False
-    langsmith_details: Optional[Dict[str, Any]] = None
+    graph_compiled: bool = False
 
-class MetricsResponse(BaseModel):
-    """Simple metrics endpoint for monitoring"""
-    total_requests: int
-    avg_execution_time: float
-    success_rate: float
-    langsmith_traces: int
-
-# Global variables for graph compilation and metrics
+# ==========================
+# Global variables and metrics
+# ==========================
 compiled_graph = None
 langsmith_client = None
 metrics = {
     "total_requests": 0,
     "successful_requests": 0,
+    "failed_requests": 0,
     "total_execution_time": 0.0,
-    "langsmith_traces": 0
+    "avg_execution_time": 0.0
 }
 
-@traceable(name="research_graph_execution", tags=["graph", "research"])
+# ==========================
+# Graph execution with proper error handling
+# ==========================
+@traceable(name="research_graph_execution") if LANGSMITH_AVAILABLE else lambda f: f
 def execute_research_graph(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Traced wrapper for graph execution with proper metadata"""
+    """Execute research graph with comprehensive error handling"""
     global compiled_graph, metrics
     
     start_time = time.time()
     
-    # Add trace metadata
-    current_run = get_current_run_tree()
-    if current_run:
-        current_run.update(
-            metadata={
-                "topic": state.get("topic", "unknown"),
-                "depth": state.get("depth", 1),
-                "audience": state.get("audience", "general"),
-                "is_follow_up": state.get("follow_up", False),
-                "session_id": state.get("session_id"),
-            }
-        )
-        current_run.add_tags(["execution", "core"])
+    # Add trace metadata if available
+    if LANGSMITH_AVAILABLE:
+        try:
+            current_run = get_current_run_tree()
+            if current_run:
+                current_run.update(
+                    metadata={
+                        "topic": state.get("topic"),
+                        "depth": state.get("depth"),
+                        "is_follow_up": state.get("follow_up", False),
+                        "session_id": state.get("session_id"),
+                    }
+                )
+        except Exception:
+            pass  # Ignore tracing errors
     
     try:
-        # Execute the research graph
-        logger.info(f"🔍 Executing research graph for topic: {state.get('topic')}")
+        # Ensure state is properly initialized
+        state = initialize_state(state)
+        
+        logger.info(f"Executing research graph for: {state.get('topic')}")
+        
+        # Execute graph
+        if not compiled_graph:
+            raise RuntimeError("Graph not compiled")
+        
         final_state = compiled_graph.invoke(state)
         
         execution_time = time.time() - start_time
@@ -163,223 +178,156 @@ def execute_research_graph(state: Dict[str, Any]) -> Dict[str, Any]:
         # Update metrics
         metrics["total_execution_time"] += execution_time
         metrics["successful_requests"] += 1
-        if langsmith_client:
-            metrics["langsmith_traces"] += 1
+        metrics["avg_execution_time"] = metrics["total_execution_time"] / (
+            metrics["successful_requests"] + metrics["failed_requests"]
+        )
         
-        logger.info(f"✅ Graph execution completed in {execution_time:.2f}s")
+        # Add execution metadata to state
+        final_state["api_execution_time"] = execution_time
         
-        # Add execution metadata
-        if isinstance(final_state, dict):
-            final_state["execution_time_seconds"] = execution_time
-            final_state["langsmith_traced"] = langsmith_client is not None
-        else:
-            setattr(final_state, "execution_time_seconds", execution_time)
-            setattr(final_state, "langsmith_traced", langsmith_client is not None)
-        
+        logger.info(f"Graph execution completed in {execution_time:.2f}s")
         return final_state
         
     except Exception as e:
         execution_time = time.time() - start_time
-        logger.error(f"❌ Graph execution failed after {execution_time:.2f}s: {e}")
+        metrics["failed_requests"] += 1
         
-        # Add error info to trace
-        if current_run:
-            current_run.update(
-                metadata={
-                    "error": str(e),
-                    "execution_time": execution_time,
-                    "status": "failed"
-                }
-            )
-            current_run.add_tags(["error"])
+        logger.error(f"Graph execution failed after {execution_time:.2f}s: {e}")
         
-        raise
+        # Return error state instead of raising
+        error_state = initialize_state(state.copy())
+        error_state.update({
+            "execution_status": "failed",
+            "errors": [f"Graph execution failed: {str(e)}"],
+            "api_execution_time": execution_time,
+            "final_brief": None
+        })
+        
+        return error_state
 
-def get_langsmith_health() -> Dict[str, Any]:
-    """Get detailed LangSmith health information"""
-    global langsmith_client
-    
-    health_info = {
-        "enabled": langsmith_client is not None,
-        "client_initialized": langsmith_client is not None,
-        "environment_vars": {
-            "LANGCHAIN_API_KEY": "***SET***" if os.getenv("LANGCHAIN_API_KEY") else "❌ MISSING",
-            "LANGCHAIN_PROJECT": os.getenv("LANGCHAIN_PROJECT") or "❌ MISSING",
-            "LANGSMITH_PROJECT": os.getenv("LANGSMITH_PROJECT") or "❌ MISSING",
-            "LANGCHAIN_ENDPOINT": os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com"),
-            "LANGCHAIN_TRACING_V2": os.getenv("LANGCHAIN_TRACING_V2", "false")
-        },
-        "project_name": os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT") or "unknown"
-    }
-    
-    # Test connection if client exists
-    if langsmith_client:
-        try:
-            projects = list(langsmith_client.list_projects(limit=1))
-            health_info["connection_test"] = "✅ Success"
-            health_info["projects_accessible"] = len(projects)
-        except Exception as e:
-            health_info["connection_test"] = f"❌ Failed: {str(e)}"
-    else:
-        health_info["connection_test"] = "❌ No client available"
-    
-    return health_info
-
+# ==========================
+# FastAPI app setup
+# ==========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: compile the graph and initialize LangSmith
     global compiled_graph, langsmith_client
     
     try:
-        # Initialize LangSmith first
-        print("🔄 Initializing LangSmith...")
+        print("Initializing services...")
+        
+        # Initialize LangSmith
         langsmith_client = init_langsmith()
         
-        if langsmith_client:
-            print("✅ LangSmith initialized successfully")
-        else:
-            print("⚠️ LangSmith initialization failed - continuing without tracing")
-        
-        print("🚀 Compiling research graph...")
+        # Compile graph
+        print("Compiling research graph...")
         compiled_graph = graph.compile()
-        print("✅ Graph compiled successfully!")
+        print("Graph compiled successfully!")
         
-        # Print startup summary
-        health = get_langsmith_health()
-        print("📊 Startup Summary:")
-        print(f"  LangSmith: {'✅ Enabled' if health['enabled'] else '❌ Disabled'}")
-        print(f"  Project: {health['project_name']}")
+        # Test execution
+        print("Testing graph execution...")
+        test_state = {
+            "topic": "Test Topic",
+            "depth": 1,
+            "audience": "test",
+            "user_id": "test",
+            "session_id": str(uuid.uuid4()),
+            "follow_up": False
+        }
         
+        test_result = execute_research_graph(test_state)
+        if test_result.get("execution_status") == "completed":
+            print("Graph test successful!")
+        else:
+            print(f"Graph test completed with status: {test_result.get('execution_status')}")
+            
     except Exception as e:
-        print(f"❌ Failed to compile graph: {e}")
+        print(f"Startup failed: {e}")
         raise
     
     yield
     
-    # Shutdown: cleanup if needed
-    print("🔄 Shutting down API...")
-    if langsmith_client:
-        print("📊 LangSmith session completed")
+    print("Shutting down...")
 
-# Initialize FastAPI app
 app = FastAPI(
-    title="Context-Aware Research Brief API",
-    description="Generate comprehensive research briefs with context-aware follow-up capabilities",
+    title="Research Brief API",
+    description="Generate research briefs with LangGraph",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
     lifespan=lifespan
 )
 
-@app.get("/")
-def root():
-    return {"message": "Welcome to the Context-Aware Research Brief API! Go to /docs for the API docs."}
-
-# Add CORS middleware
+# Add CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ==========================
+# API endpoints
+# ==========================
+@app.get("/")
+def root():
+    return {
+        "message": "Research Brief API",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint with detailed LangSmith status"""
-    global langsmith_client
-    
-    langsmith_details = get_langsmith_health()
-    
+def health_check():
+    """Health check with service status"""
     return HealthResponse(
-        status="healthy",
         timestamp=datetime.now().isoformat(),
         langsmith_enabled=langsmith_client is not None,
-        langsmith_details=langsmith_details
+        graph_compiled=compiled_graph is not None
     )
 
-@app.get("/metrics", response_model=MetricsResponse)
-async def get_metrics():
-    """Get basic application metrics"""
-    global metrics
-    
-    avg_execution_time = (
-        metrics["total_execution_time"] / metrics["total_requests"] 
-        if metrics["total_requests"] > 0 else 0.0
-    )
-    
-    success_rate = (
-        metrics["successful_requests"] / metrics["total_requests"] 
-        if metrics["total_requests"] > 0 else 0.0
-    )
-    
-    return MetricsResponse(
-        total_requests=metrics["total_requests"],
-        avg_execution_time=round(avg_execution_time, 2),
-        success_rate=round(success_rate, 2),
-        langsmith_traces=metrics["langsmith_traces"]
-    )
+@app.get("/metrics")
+def get_metrics():
+    """Get application metrics"""
+    return {
+        "total_requests": metrics["total_requests"],
+        "successful_requests": metrics["successful_requests"],
+        "failed_requests": metrics["failed_requests"],
+        "success_rate": metrics["successful_requests"] / max(1, metrics["total_requests"]),
+        "avg_execution_time": round(metrics["avg_execution_time"], 2),
+        "langsmith_enabled": langsmith_client is not None
+    }
 
-@traceable(name="generate_research_brief_api", tags=["api", "research_brief"])
+@traceable(name="api_generate_brief") if LANGSMITH_AVAILABLE else lambda f: f
 @app.post("/brief", response_model=ResearchBriefResponse)
-async def generate_research_brief(request: ResearchBriefRequest):
+def generate_research_brief(request: ResearchBriefRequest):
     """
-    Generate a comprehensive research brief with full observability
+    Generate a research brief
     
-    - **topic**: The research topic to investigate
-    - **depth**: Research depth level (1=basic, 5=comprehensive)
-    - **audience**: Target audience for the brief
+    - **topic**: Research topic (3-200 characters)
+    - **depth**: Research depth level 1-5 (default: 2)
+    - **audience**: Target audience (default: "general")
     - **follow_up**: Whether this builds on previous research
     - **user_id**: User identifier (auto-generated if not provided)
-    - **parent_session_id**: Previous session to build upon (for follow-ups)
+    - **parent_session_id**: Previous session for follow-ups
     """
-    global compiled_graph, metrics, langsmith_client
+    global compiled_graph, metrics
     
     # Update request metrics
     metrics["total_requests"] += 1
     
     if not compiled_graph:
-        raise HTTPException(status_code=503, detail="Research graph not initialized")
+        metrics["failed_requests"] += 1
+        raise HTTPException(status_code=503, detail="Research graph not available")
     
     api_start_time = time.time()
     
     try:
-        # Generate IDs
+        # Generate session info
         session_id = str(uuid.uuid4())
         user_id = request.user_id or str(uuid.uuid4())
         
-        # Set trace metadata at API level
-        current_run = get_current_run_tree()
-        if current_run:
-            current_run.update(
-                name=f"Research: {request.topic[:50]}...",
-                metadata={
-                    "api_endpoint": "/brief",
-                    "topic": request.topic,
-                    "depth": request.depth,
-                    "audience": request.audience,
-                    "follow_up": request.follow_up,
-                    "session_id": session_id,
-                    "user_id": user_id[:8] + "..." if user_id else "unknown"
-                }
-            )
-            current_run.add_tags(["api", "research"])
+        logger.info(f"Starting research brief - Topic: {request.topic}, User: {user_id[:8]}")
         
-        logger.info(f"🎯 Starting research brief generation - Topic: {request.topic}, User: {user_id[:8]}...")
-        
-        # Validate follow-up logic
-        if request.follow_up and not request.parent_session_id:
-            # Try to get the most recent session for this user
-            try:
-                history_store = get_history_store()
-                user_history = history_store.get_user_history(user_id, limit=1)
-                if user_history:
-                    request.parent_session_id = user_history[0].id if hasattr(user_history[0], 'id') else None
-                    logger.info(f"🔗 Found parent session for follow-up: {request.parent_session_id}")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not retrieve user history for follow-up: {e}")
-        
-        # Create comprehensive initial state
+        # Create initial state
         state = {
             "topic": request.topic,
             "depth": request.depth,
@@ -388,64 +336,23 @@ async def generate_research_brief(request: ResearchBriefRequest):
             "user_id": user_id,
             "session_id": session_id,
             "parent_session_id": request.parent_session_id,
-            "created_at": datetime.now().isoformat(),
-            "session_type": "follow_up" if request.follow_up else "initial",
-            "is_follow_up": request.follow_up
+            "created_at": datetime.now().isoformat()
         }
         
-        # Execute the research graph with tracing
+        # Execute graph
         final_state = execute_research_graph(state)
         
-        # Ensure session metadata is preserved
-        final_state = ensure_session_metadata(state, final_state)
+        # Extract results
+        brief = final_state.get("final_brief", {})
+        context_summary = final_state.get("context_summary")
+        execution_status = final_state.get("execution_status", "unknown")
         
-        # Extract the final brief
-        brief_data = None
-        if isinstance(final_state, dict) and 'final_brief' in final_state:
-            brief_data = final_state['final_brief']
-        elif hasattr(final_state, 'final_brief'):
-            brief_data = final_state.final_brief
-        else:
-            brief_data = final_state
-        
-        if not brief_data:
-            raise HTTPException(status_code=500, detail="No research brief generated")
-        
-        # Convert to JSON serializable format
-        if hasattr(brief_data, 'model_dump'):
-            try:
-                brief_json = brief_data.model_dump(mode="json")
-            except Exception:
-                brief_json = convert_to_json_serializable(brief_data)
-        else:
-            brief_json = convert_to_json_serializable(brief_data)
-        
-        # Extract context summary if available
-        context_summary = None
-        if request.follow_up:
-            context_summary = final_state.get('context_summary') if isinstance(final_state, dict) else getattr(final_state, 'context_summary', None)
-            if context_summary:
-                context_summary = convert_to_json_serializable(context_summary)
-        
-        # Calculate total execution time
+        # Calculate timing
         total_execution_time = time.time() - api_start_time
-        graph_execution_time = final_state.get('execution_time_seconds') if isinstance(final_state, dict) else getattr(final_state, 'execution_time_seconds', None)
+        graph_execution_time = final_state.get("api_execution_time", total_execution_time)
         
-        # Generate trace URL properly
+        # Get trace URL
         trace_url = get_trace_url()
-        
-        # Add final metadata to trace
-        if current_run:
-            current_run.update(
-                metadata={
-                    "total_execution_time": total_execution_time,
-                    "graph_execution_time": graph_execution_time,
-                    "status": "success",
-                    "brief_sections": len(brief_json.get('sections', [])) if isinstance(brief_json, dict) else 0,
-                    "references_count": len(brief_json.get('references', [])) if isinstance(brief_json, dict) else 0
-                }
-            )
-            current_run.add_tags(["completed", "success"])
         
         # Build response
         response = ResearchBriefResponse(
@@ -454,197 +361,191 @@ async def generate_research_brief(request: ResearchBriefRequest):
             audience=request.audience,
             depth=request.depth,
             is_follow_up=request.follow_up,
-            created_at=state["created_at"],
             user_id=user_id,
             parent_session_id=request.parent_session_id,
+            created_at=state["created_at"],
+            execution_status=execution_status,
+            
+            # Brief content
+            thesis=brief.get("thesis"),
+            sections=brief.get("sections", []),
+            references=brief.get("references", []),
             context_summary=context_summary,
-            execution_time_seconds=round(graph_execution_time or total_execution_time, 2),
-            trace_url=trace_url,
-            # Extract brief fields safely
-            thesis=brief_json.get('thesis') if isinstance(brief_json, dict) else getattr(brief_json, 'thesis', None),
-            sections=brief_json.get('sections', []) if isinstance(brief_json, dict) else getattr(brief_json, 'sections', []),
-            references=brief_json.get('references', []) if isinstance(brief_json, dict) else getattr(brief_json, 'references', [])
+            
+            # Observability
+            execution_time_seconds=round(graph_execution_time, 2),
+            total_tokens_used=final_state.get("total_tokens_used"),
+            errors=final_state.get("errors", []),
+            trace_url=trace_url
         )
         
-        logger.info(f"✅ Research brief completed - Session: {session_id}, Time: {total_execution_time:.2f}s")
+        logger.info(f"Research brief completed - Session: {session_id}, "
+                   f"Status: {execution_status}, Time: {total_execution_time:.2f}s")
         
         return response
         
     except Exception as e:
+        # Update failed metrics
         total_execution_time = time.time() - api_start_time
+        metrics["failed_requests"] += 1
         
-        # Add error metadata to trace
-        current_run = get_current_run_tree()
-        if current_run:
-            current_run.update(
-                metadata={
-                    "error": str(e),
-                    "total_execution_time": total_execution_time,
-                    "status": "failed"
-                }
-            )
-            current_run.add_tags(["error", "failed"])
-        
-        logger.error(f"❌ Research brief failed after {total_execution_time:.2f}s - Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate research brief: {str(e)}")
+        logger.error(f"API request failed after {total_execution_time:.2f}s: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to generate research brief: {str(e)}"
+        )
 
-# Add LangSmith testing endpoints
-@app.get("/test/langsmith/quick")
-async def test_langsmith_quick():
-    """Quick LangSmith test endpoint"""
-    global langsmith_client
+@app.post("/brief/validate")
+def validate_request(request: ResearchBriefRequest):
+    """Validate a research brief request without executing it"""
+    
+    errors = []
+    warnings = []
+    
+    # Topic validation
+    if len(request.topic.strip()) < 3:
+        errors.append("Topic too short (minimum 3 characters)")
+    if len(request.topic.strip()) > 200:
+        errors.append("Topic too long (maximum 200 characters)")
+    
+    # Depth validation
+    if request.depth < 1 or request.depth > 5:
+        errors.append("Depth must be between 1 and 5")
+    
+    # Follow-up validation
+    if request.follow_up and not request.parent_session_id and not request.user_id:
+        warnings.append("Follow-up requested but no parent session or user ID provided")
+    
+    # Performance warnings
+    if request.depth >= 4:
+        warnings.append("High depth levels may take longer to execute")
+    
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "estimated_execution_time": f"{request.depth * 30}-{request.depth * 60} seconds"
+    }
+
+@app.get("/test/simple")
+def test_simple():
+    """Simple test endpoint for basic functionality"""
+    try:
+        test_state = {
+            "topic": "Simple Test",
+            "depth": 1,
+            "audience": "test",
+            "user_id": "test_user",
+            "session_id": str(uuid.uuid4()),
+            "follow_up": False
+        }
+        
+        result = execute_research_graph(test_state)
+        
+        return {
+            "test_passed": result.get("execution_status") == "completed",
+            "execution_status": result.get("execution_status"),
+            "errors": result.get("errors", []),
+            "execution_time": result.get("api_execution_time", 0),
+            "brief_generated": bool(result.get("final_brief"))
+        }
+        
+    except Exception as e:
+        return {
+            "test_passed": False,
+            "error": str(e),
+            "message": "Simple test failed"
+        }
+
+@app.get("/test/langsmith")
+def test_langsmith():
+    """Test LangSmith tracing functionality"""
+    if not LANGSMITH_AVAILABLE:
+        return {
+            "langsmith_available": False,
+            "message": "LangSmith package not installed"
+        }
     
     if not langsmith_client:
         return {
-            "langsmith_working": False,
-            "message": "LangSmith client not initialized",
-            "health": get_langsmith_health()
+            "langsmith_available": True,
+            "langsmith_initialized": False,
+            "message": "LangSmith not initialized - check environment variables"
         }
     
     try:
-        @traceable(name="quick_test", tags=["test", "health_check"])
-        def quick_test():
+        @traceable(name="langsmith_test")
+        def test_function():
             return {
-                "status": "working",
+                "test_id": str(uuid.uuid4()),
                 "timestamp": datetime.now().isoformat(),
-                "test_id": str(uuid.uuid4())
+                "message": "LangSmith test successful"
             }
         
-        result = quick_test()
+        result = test_function()
         trace_url = get_trace_url()
         
         return {
-            "langsmith_working": True,
-            "test_result": result,
-            "trace_url": trace_url,
-            "message": "LangSmith is working correctly"
+            "langsmith_available": True,
+            "langsmith_initialized": True,
+            "test_passed": True,
+            "result": result,
+            "trace_url": trace_url
         }
         
     except Exception as e:
         return {
-            "langsmith_working": False,
-            "error": str(e),
-            "message": "LangSmith test failed"
+            "langsmith_available": True,
+            "langsmith_initialized": True,
+            "test_passed": False,
+            "error": str(e)
         }
 
-@app.get("/users/{user_id}/history", response_model=UserHistoryResponse)
-async def get_user_history(user_id: str, limit: int = 10):
-    """
-    Get research history for a specific user
-    
-    - **user_id**: User identifier
-    - **limit**: Maximum number of sessions to return (default: 10)
-    """
-    try:
-        history_store = get_history_store()
-        user_history = history_store.get_user_history(user_id, limit=limit)
-        
-        # Convert history to JSON serializable format
-        sessions = []
-        for session in user_history:
-            session_data = convert_to_json_serializable(session)
-            sessions.append(session_data)
-        
-        return UserHistoryResponse(
-            user_id=user_id,
-            sessions=sessions,
-            total_count=len(sessions)
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve user history: {str(e)}")
-
-@app.delete("/users/{user_id}/history")
-async def clear_user_history(user_id: str):
-    """
-    Clear all research history for a specific user
-    
-    - **user_id**: User identifier
-    """
-    try:
-        history_store = get_history_store()
-        # Implement clear_user_history method in your history store
-        if hasattr(history_store, 'clear_user_history'):
-            history_store.clear_user_history(user_id)
-            return {"message": f"History cleared for user {user_id}", "user_id": user_id}
-        else:
-            raise HTTPException(status_code=501, detail="Clear history functionality not implemented")
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to clear user history: {str(e)}")
-
-@app.get("/sessions/{session_id}")
-async def get_session(session_id: str):
-    """
-    Get details of a specific research session
-    
-    - **session_id**: Session identifier
-    """
-    try:
-        history_store = get_history_store()
-        # Implement get_session method in your history store
-        if hasattr(history_store, 'get_session'):
-            session = history_store.get_session(session_id)
-            if session:
-                return convert_to_json_serializable(session)
-            else:
-                raise HTTPException(status_code=404, detail="Session not found")
-        else:
-            raise HTTPException(status_code=501, detail="Session retrieval not implemented")
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve session: {str(e)}")
-
-# Background task for async processing (optional)
-@app.post("/brief/async")
-async def generate_research_brief_async(request: ResearchBriefRequest, background_tasks: BackgroundTasks):
-    """
-    Generate a research brief asynchronously (returns immediately with session_id)
-    
-    Note: This is a placeholder for async processing. You would need to implement
-    a job queue system (like Celery, RQ, or similar) for production use.
-    """
-    session_id = str(uuid.uuid4())
-    
-    # Add background task (placeholder)
-    # background_tasks.add_task(process_research_brief_async, request, session_id)
-    
-    return {
-        "session_id": session_id,
-        "status": "processing",
-        "message": "Research brief generation started. Use GET /sessions/{session_id} to check status.",
-        "estimated_time": "2-5 minutes"
-    }
-
-# Exception handlers
-@app.exception_handler(404)
-async def not_found_handler(request, exc):
+# ==========================
+# Error handlers
+# ==========================
+@app.exception_handler(422)
+async def validation_exception_handler(request, exc):
     return JSONResponse(
-        status_code=404,
+        status_code=422,
         content={
-            "error": "Not Found",
-            "message": "The requested resource was not found",
-            "status_code": 404
+            "error": "Validation Error",
+            "message": "Request validation failed",
+            "details": exc.errors() if hasattr(exc, 'errors') else str(exc)
         }
     )
 
-@app.exception_handler(500)
-async def internal_error_handler(request, exc):
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": f"HTTP {exc.status_code}",
+            "message": exc.detail
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(
         status_code=500,
         content={
             "error": "Internal Server Error",
             "message": "An unexpected error occurred",
-            "status_code": 500
+            "type": type(exc).__name__
         }
     )
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # Development server configuration
     uvicorn.run(
-        "api:app",  # Assuming this file is named api.py
+        "api:app",
         host="0.0.0.0",
         port=8000,
         reload=True,
-        log_level="info"
+        log_level="info",
+        access_log=True
     )
