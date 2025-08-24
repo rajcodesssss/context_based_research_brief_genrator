@@ -11,8 +11,9 @@ import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-# LangSmith imports - Fixed
-from langsmith import Client, traceable, get_current_run_tree
+# LangSmith imports - Updated for compatibility
+from langsmith import Client, traceable
+import langsmith
 
 # Import your existing modules
 from graphs import graph
@@ -68,10 +69,15 @@ def init_langsmith():
 def get_trace_url() -> Optional[str]:
     """Get the current trace URL properly"""
     try:
-        current_run = get_current_run_tree()
-        if current_run and hasattr(current_run, 'id'):
+        # Updated method to get trace URL
+        run_id = langsmith.get_current_run_tree()
+        if run_id:
             project = os.getenv("LANGCHAIN_PROJECT") or os.getenv("LANGSMITH_PROJECT", "default")
-            return f"https://smith.langchain.com/projects/{project}/runs/{current_run.id}"
+            # Get the actual run ID
+            if hasattr(run_id, 'id'):
+                return f"https://smith.langchain.com/projects/{project}/runs/{run_id.id}"
+            elif hasattr(run_id, 'run_id'):
+                return f"https://smith.langchain.com/projects/{project}/runs/{run_id.run_id}"
         return None
     except Exception as e:
         logger.debug(f"Could not get trace URL: {e}")
@@ -132,26 +138,25 @@ metrics = {
     "langsmith_traces": 0
 }
 
-@traceable(name="research_graph_execution", tags=["graph", "research"])
+@traceable(
+    name="research_graph_execution",
+    metadata={"component": "graph", "type": "research"},
+    tags=["graph", "research"]
+)
 def execute_research_graph(state: Dict[str, Any]) -> Dict[str, Any]:
     """Traced wrapper for graph execution with proper metadata"""
     global compiled_graph, metrics
     
     start_time = time.time()
     
-    # Add trace metadata
-    current_run = get_current_run_tree()
-    if current_run:
-        current_run.update(
-            metadata={
-                "topic": state.get("topic", "unknown"),
-                "depth": state.get("depth", 1),
-                "audience": state.get("audience", "general"),
-                "is_follow_up": state.get("follow_up", False),
-                "session_id": state.get("session_id"),
-            }
-        )
-        current_run.add_tags(["execution", "core"])
+    # Create metadata for the trace
+    trace_metadata = {
+        "topic": state.get("topic", "unknown"),
+        "depth": state.get("depth", 1),
+        "audience": state.get("audience", "general"),
+        "is_follow_up": state.get("follow_up", False),
+        "session_id": state.get("session_id"),
+    }
     
     try:
         # Execute the research graph
@@ -181,18 +186,6 @@ def execute_research_graph(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         execution_time = time.time() - start_time
         logger.error(f"❌ Graph execution failed after {execution_time:.2f}s: {e}")
-        
-        # Add error info to trace
-        if current_run:
-            current_run.update(
-                metadata={
-                    "error": str(e),
-                    "execution_time": execution_time,
-                    "status": "failed"
-                }
-            )
-            current_run.add_tags(["error"])
-        
         raise
 
 def get_langsmith_health() -> Dict[str, Any]:
@@ -320,7 +313,11 @@ async def get_metrics():
         langsmith_traces=metrics["langsmith_traces"]
     )
 
-@traceable(name="generate_research_brief_api", tags=["api", "research_brief"])
+@traceable(
+    name="generate_research_brief_api",
+    metadata={"endpoint": "/brief", "api_version": "1.0.0"},
+    tags=["api", "research_brief"]
+)
 @app.post("/brief", response_model=ResearchBriefResponse)
 async def generate_research_brief(request: ResearchBriefRequest):
     """
@@ -347,23 +344,6 @@ async def generate_research_brief(request: ResearchBriefRequest):
         # Generate IDs
         session_id = str(uuid.uuid4())
         user_id = request.user_id or str(uuid.uuid4())
-        
-        # Set trace metadata at API level
-        current_run = get_current_run_tree()
-        if current_run:
-            current_run.update(
-                name=f"Research: {request.topic[:50]}...",
-                metadata={
-                    "api_endpoint": "/brief",
-                    "topic": request.topic,
-                    "depth": request.depth,
-                    "audience": request.audience,
-                    "follow_up": request.follow_up,
-                    "session_id": session_id,
-                    "user_id": user_id[:8] + "..." if user_id else "unknown"
-                }
-            )
-            current_run.add_tags(["api", "research"])
         
         logger.info(f"🎯 Starting research brief generation - Topic: {request.topic}, User: {user_id[:8]}...")
         
@@ -434,19 +414,6 @@ async def generate_research_brief(request: ResearchBriefRequest):
         # Generate trace URL properly
         trace_url = get_trace_url()
         
-        # Add final metadata to trace
-        if current_run:
-            current_run.update(
-                metadata={
-                    "total_execution_time": total_execution_time,
-                    "graph_execution_time": graph_execution_time,
-                    "status": "success",
-                    "brief_sections": len(brief_json.get('sections', [])) if isinstance(brief_json, dict) else 0,
-                    "references_count": len(brief_json.get('references', [])) if isinstance(brief_json, dict) else 0
-                }
-            )
-            current_run.add_tags(["completed", "success"])
-        
         # Build response
         response = ResearchBriefResponse(
             session_id=session_id,
@@ -472,19 +439,6 @@ async def generate_research_brief(request: ResearchBriefRequest):
         
     except Exception as e:
         total_execution_time = time.time() - api_start_time
-        
-        # Add error metadata to trace
-        current_run = get_current_run_tree()
-        if current_run:
-            current_run.update(
-                metadata={
-                    "error": str(e),
-                    "total_execution_time": total_execution_time,
-                    "status": "failed"
-                }
-            )
-            current_run.add_tags(["error", "failed"])
-        
         logger.error(f"❌ Research brief failed after {total_execution_time:.2f}s - Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate research brief: {str(e)}")
 
@@ -502,7 +456,11 @@ async def test_langsmith_quick():
         }
     
     try:
-        @traceable(name="quick_test", tags=["test", "health_check"])
+        @traceable(
+            name="quick_test",
+            metadata={"test_type": "health_check"},
+            tags=["test", "health_check"]
+        )
         def quick_test():
             return {
                 "status": "working",
