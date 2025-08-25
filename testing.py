@@ -193,7 +193,7 @@ def conduct_research():
     
     audience = Prompt.ask("Target audience", default="general").strip() or "general"
     
-    # Conduct research
+
     try:
         api_response, error = call_research_api(
             api_url=api_url,
