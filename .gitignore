@@ -29,10 +29,12 @@ Thumbs.db
 htmlcov/
 
 # ---- Results / Generated files ----
-result/
+research_outputs/
+result/y
 results/
 *.out
 *.tmp
+result/
 
 # ---- Custom ----
 user_history.db
