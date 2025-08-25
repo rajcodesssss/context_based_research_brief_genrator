@@ -1,532 +1,576 @@
-#!/usr/bin/env python3
-"""
-CLI Research Tool - Context-Aware Research Brief Client
-Connects to your deployed API on Render for research brief generation
-"""
-
-import os
+from __future__ import annotations
 import json
-import sqlite3
-import requests
+import os
 import uuid
 from datetime import datetime
-from pathlib import Path
-from typing import Optional, Dict, Any, List
 from rich import print as rprint
 from rich.panel import Panel
+from rich.pretty import Pretty
 from rich.table import Table
 from rich.prompt import Prompt, Confirm
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.console import Console
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from pydantic import BaseModel
+from typing import Any, Dict, Optional, List, Union
 
-# Import PDF converter
-from pdf_converter import generate_pdf_report, generate_research_paper, generate_brief_summary
+# Import your modules (assuming they exist)
+from graphs import graph, GraphState
+from models import get_history_store, ResearchRequest
 
-console = Console()
+def debug_session_state(state, final_state):
+    """Debug function to inspect session state for troubleshooting"""
+    rprint("\n[bold yellow]🔍 Debug Information[/bold yellow]")
+    
+    # Check initial state
+    rprint("[blue]Initial State:[/blue]")
+    if isinstance(state, dict):
+        for key, value in state.items():
+            value_preview = str(value)[:50] + "..." if len(str(value)) > 50 else str(value)
+            rprint(f"  • {key}: {type(value).__name__} = {value_preview}")
+    
+    # Check final state
+    rprint("\n[blue]Final State Structure:[/blue]")
+    rprint(f"  • Type: {type(final_state).__name__}")
+    
+    if isinstance(final_state, dict):
+        rprint("  • Keys:")
+        for key, value in final_state.items():
+            rprint(f"    - {key}: {type(value).__name__}")
+    elif hasattr(final_state, '__dict__'):
+        rprint("  • Attributes:")
+        for key, value in final_state.__dict__.items():
+            rprint(f"    - {key}: {type(value).__name__}")
+    
+    # Check session_id specifically
+    session_id_locations = []
+    
+    if isinstance(final_state, dict):
+        if 'session_id' in final_state:
+            session_id = final_state['session_id']
+            if session_id:
+                session_id_locations.append(f"dict key: {str(session_id)[:8]}...")
+    
+    if hasattr(final_state, 'session_id'):
+        session_id = final_state.session_id
+        if session_id:
+            session_id_locations.append(f"attribute: {str(session_id)[:8]}...")
+    
+    if session_id_locations:
+        rprint(f"[green]✓ session_id found in: {', '.join(session_id_locations)}[/green]")
+    else:
+        rprint("[red]✗ session_id not found anywhere in final_state[/red]")
 
-# Configuration
-API_BASE_URL = "https://context-based-research-brief-genrator.onrender.com"  # Replace with your actual Render URL
-DB_FILE = "research_history.db"
-USER_CONFIG_FILE = "user_config.json"
-
-class ResearchDatabase:
-    """Handle SQLite database operations for research history"""
-    
-    def __init__(self, db_file: str = DB_FILE):
-        self.db_file = db_file
-        self.init_database()
-    
-    def init_database(self):
-        """Initialize the SQLite database with required tables"""
-        with sqlite3.connect(self.db_file) as conn:
-            cursor = conn.cursor()
-            
-            # Users table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id TEXT PRIMARY KEY,
-                    username TEXT UNIQUE NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Research sessions table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS research_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    username TEXT NOT NULL,
-                    topic TEXT NOT NULL,
-                    depth INTEGER NOT NULL,
-                    audience TEXT NOT NULL,
-                    is_follow_up BOOLEAN DEFAULT FALSE,
-                    parent_session_id TEXT,
-                    status TEXT DEFAULT 'completed',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    execution_time REAL,
-                    json_file_path TEXT,
-                    pdf_file_path TEXT,
-                    api_response TEXT,
-                    FOREIGN KEY (user_id) REFERENCES users (id)
-                )
-            ''')
-            
-            conn.commit()
-            rprint("[green]Database initialized successfully[/green]")
-    
-    def create_user(self, username: str) -> str:
-        """Create a new user and return user_id"""
-        user_id = str(uuid.uuid4())
-        
-        with sqlite3.connect(self.db_file) as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute('''
-                    INSERT INTO users (id, username) VALUES (?, ?)
-                ''', (user_id, username))
-                conn.commit()
-                rprint(f"[green]User '{username}' created successfully[/green]")
-                return user_id
-            except sqlite3.IntegrityError:
-                raise ValueError(f"Username '{username}' already exists")
-    
-    def get_user(self, username: str) -> Optional[Dict]:
-        """Get user by username"""
-        with sqlite3.connect(self.db_file) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT id, username, created_at, last_active 
-                FROM users WHERE username = ?
-            ''', (username,))
-            
-            row = cursor.fetchone()
-            if row:
-                return {
-                    'id': row[0],
-                    'username': row[1],
-                    'created_at': row[2],
-                    'last_active': row[3]
-                }
+def convert_to_json_serializable(obj):
+    """Convert complex objects to JSON serializable format with better HttpUrl handling"""
+    if obj is None:
         return None
-    
-    def update_last_active(self, user_id: str):
-        """Update user's last active timestamp"""
-        with sqlite3.connect(self.db_file) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE users SET last_active = CURRENT_TIMESTAMP 
-                WHERE id = ?
-            ''', (user_id,))
-            conn.commit()
-    
-    def save_research_session(self, session_data: Dict):
-        """Save research session to database"""
-        with sqlite3.connect(self.db_file) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO research_sessions 
-                (session_id, user_id, username, topic, depth, audience, 
-                 is_follow_up, parent_session_id, execution_time, 
-                 json_file_path, pdf_file_path, api_response)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                session_data['session_id'],
-                session_data['user_id'],
-                session_data['username'],
-                session_data['topic'],
-                session_data['depth'],
-                session_data['audience'],
-                session_data['is_follow_up'],
-                session_data.get('parent_session_id'),
-                session_data.get('execution_time'),
-                session_data.get('json_file_path'),
-                session_data.get('pdf_file_path'),
-                json.dumps(session_data.get('api_response', {}))
-            ))
-            conn.commit()
-    
-    def get_user_history(self, user_id: str, limit: int = 10) -> List[Dict]:
-        """Get user's research history"""
-        with sqlite3.connect(self.db_file) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT session_id, topic, depth, audience, is_follow_up, 
-                       created_at, execution_time, json_file_path, pdf_file_path
-                FROM research_sessions 
-                WHERE user_id = ? 
-                ORDER BY created_at DESC 
-                LIMIT ?
-            ''', (user_id, limit))
-            
-            rows = cursor.fetchall()
-            return [{
-                'session_id': row[0],
-                'topic': row[1],
-                'depth': row[2],
-                'audience': row[3],
-                'is_follow_up': bool(row[4]),
-                'created_at': row[5],
-                'execution_time': row[6],
-                'json_file_path': row[7],
-                'pdf_file_path': row[8]
-            } for row in rows]
-    
-    def get_all_users(self) -> List[Dict]:
-        """Get all users"""
-        with sqlite3.connect(self.db_file) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT u.username, u.created_at, u.last_active,
-                       COUNT(r.session_id) as research_count
-                FROM users u
-                LEFT JOIN research_sessions r ON u.id = r.user_id
-                GROUP BY u.id
-                ORDER BY u.last_active DESC
-            ''')
-            
-            rows = cursor.fetchall()
-            return [{
-                'username': row[0],
-                'created_at': row[1],
-                'last_active': row[2],
-                'research_count': row[3]
-            } for row in rows]
-
-class APIClient:
-    """Handle API communication with the deployed research service"""
-    
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip('/')
-        self.session = requests.Session()
-        self.session.headers.update({
-            'Content-Type': 'application/json',
-            'User-Agent': 'Research-CLI-Tool/1.0'
-        })
-    
-    def check_health(self) -> bool:
-        """Check if API is healthy"""
+    elif isinstance(obj, (str, int, float, bool)):
+        return obj
+    elif isinstance(obj, list):
+        return [convert_to_json_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
+    elif hasattr(obj, 'model_dump'):
+        # Pydantic models - handle serialization modes
         try:
-            response = self.session.get(f"{self.base_url}/health", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+            return obj.model_dump(mode="json")
+        except Exception as e:
+            rprint(f"[yellow]Warning: model_dump failed: {e}[/yellow]")
+            # Fallback to dict conversion
+            return convert_to_json_serializable(obj.__dict__)
+    elif hasattr(obj, '__dict__'):
+        # Regular objects with __dict__
+        result = {}
+        for key, value in obj.__dict__.items():
+            if not key.startswith('_'):  # Skip private attributes
+                try:
+                    # Special handling for HttpUrl and similar objects
+                    if hasattr(value, '__str__') and 'Url' in type(value).__name__:
+                        result[key] = str(value)
+                    else:
+                        result[key] = convert_to_json_serializable(value)
+                except Exception as e:
+                    # Convert problematic objects to string representation
+                    result[key] = str(value)
+        return result
+    elif hasattr(obj, '__str__'):
+        # For HttpUrl and other string-convertible objects
+        return str(obj)
+    else:
+        # Last resort fallback
+        return str(obj)
+
+def safe_json_dump(data, file_path):
+    """Safely dump data to JSON with proper error handling"""
+    try:
+        # Convert to JSON serializable format first
+        json_data = convert_to_json_serializable(data)
+        
+        # Test serialization before writing to file
+        test_json = json.dumps(json_data, ensure_ascii=False, indent=2)
+        
+        # If test passes, write to file
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(test_json)
+        
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def get_or_create_user_id():
+    """Get existing user ID or create a new one"""
+    user_file = "user_profile.txt"
     
-    def generate_research_brief(self, request_data: Dict) -> Dict:
-        """Generate research brief via API"""
-        try:
-            response = self.session.post(
-                f"{self.base_url}/brief",
-                json=request_data,
-                timeout=300  # 5 minutes timeout for research
-            )
+    if os.path.exists(user_file):
+        with open(user_file, 'r') as f:
+            stored_user_id = f.read().strip()
+        
+        if stored_user_id:  # Check if file is not empty
+            use_existing = Confirm.ask(f"Continue as user '{stored_user_id[:8]}...'?", default=True)
+            if use_existing:
+                return stored_user_id
+    
+    # Create new user ID
+    new_user_id = str(uuid.uuid4())
+    
+    # Save for future sessions
+    with open(user_file, 'w') as f:
+        f.write(new_user_id)
+    
+    rprint(f"[green]👤 Created new user profile: {new_user_id[:8]}...[/green]")
+    return new_user_id
+
+def show_user_history(user_id: str):
+    """Display user's research history in a nice table"""
+    try:
+        history_store = get_history_store()
+        user_history = history_store.get_user_history(user_id, limit=10)
+        
+        if not user_history:
+            rprint("[dim]📚 No previous research history found.[/dim]")
+            return
+        
+        rprint(f"\n[bold blue]📚 Your Research History ({len(user_history)} sessions)[/bold blue]")
+        
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Date", style="dim", width=12)
+        table.add_column("Topic", style="cyan", min_width=30)
+        table.add_column("Type", justify="center", width=10)
+        table.add_column("Depth", justify="center", width=5)
+        
+        for session in user_history:
+            date = session.created_at.strftime('%Y-%m-%d') if hasattr(session, 'created_at') and session.created_at else 'N/A'
+            topic = session.topic[:40] + '...' if len(session.topic) > 40 else session.topic
+            session_type = "Follow-up" if getattr(session, 'is_follow_up', False) else "Initial"
             
-            if response.status_code == 200:
-                return response.json()
-            else:
-                error_msg = f"API Error {response.status_code}: {response.text}"
-                raise Exception(error_msg)
-                
-        except requests.Timeout:
-            raise Exception("Request timed out. Research might be taking longer than expected.")
-        except requests.RequestException as e:
-            raise Exception(f"Network error: {str(e)}")
-    
-    def get_user_history_from_api(self, user_id: str) -> Dict:
-        """Get user history from API"""
-        try:
-            response = self.session.get(f"{self.base_url}/users/{user_id}/history")
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return {"sessions": [], "total_count": 0}
-        except requests.RequestException:
-            return {"sessions": [], "total_count": 0}
+            # Safely get depth from final_brief
+            depth = 'N/A'
+            try:
+                if hasattr(session, 'final_brief') and session.final_brief:
+                    brief_data = json.loads(session.final_brief) if isinstance(session.final_brief, str) else session.final_brief
+                    depth = str(brief_data.get('depth', 'N/A'))
+            except:
+                depth = 'N/A'
+            
+            table.add_row(date, topic, session_type, depth)
+        
+        rprint(table)
+        
+    except Exception as e:
+        rprint(f"[red]Error loading history: {e}[/red]")
 
-def save_json_output(data: Dict, filename: str) -> str:
-    """Save research data to JSON file"""
-    output_dir = Path("research_outputs")
-    output_dir.mkdir(exist_ok=True)
+def display_enhanced_brief(brief_data):
+    """Display the research brief in an enhanced, readable format with better error handling"""
     
-    filepath = output_dir / filename
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+    # Safe attribute access helper
+    def safe_get_attr(obj, attr, default='Unknown'):
+        if isinstance(obj, dict):
+            return obj.get(attr, default)
+        else:
+            return getattr(obj, attr, default)
     
-    return str(filepath)
-
-def display_research_brief(brief_data: Dict):
-    """Display the research brief in a formatted way"""
-    console.print(Panel.fit(f"[bold cyan]Research Brief: {brief_data.get('topic', 'Unknown')}[/bold cyan]"))
+    # Brief header
+    topic = safe_get_attr(brief_data, 'topic', 'Unknown Topic')
+    audience = safe_get_attr(brief_data, 'audience', 'Unknown Audience')
+    depth = safe_get_attr(brief_data, 'depth', 'Unknown')
     
-    # Basic info
-    table = Table(show_header=False, box=None)
-    table.add_column("Field", style="bold blue")
-    table.add_column("Value")
+    rprint(f"[bold cyan]Topic:[/bold cyan] {topic}")
+    rprint(f"[bold cyan]Audience:[/bold cyan] {audience}")
+    rprint(f"[bold cyan]Depth Level:[/bold cyan] {depth}/5")
     
-    table.add_row("Topic", brief_data.get('topic', 'N/A'))
-    table.add_row("Audience", brief_data.get('audience', 'N/A'))
-    table.add_row("Depth", str(brief_data.get('depth', 'N/A')))
-    table.add_row("Follow-up", "Yes" if brief_data.get('is_follow_up') else "No")
-    table.add_row("Execution Time", f"{brief_data.get('execution_time_seconds', 0):.2f}s")
+    is_follow_up = safe_get_attr(brief_data, 'is_follow_up', False)
+    if is_follow_up:
+        rprint("[yellow]📎 This is a follow-up research building on previous work[/yellow]")
     
-    console.print(table)
+    rprint()
     
     # Thesis
-    if brief_data.get('thesis'):
-        console.print(f"\n[bold green]Thesis:[/bold green]")
-        console.print(Panel(brief_data['thesis'], border_style="green"))
+    thesis = safe_get_attr(brief_data, 'thesis', None)
+    if thesis:
+        rprint("[bold green]📝 Thesis:[/bold green]")
+        rprint(Panel(thesis, border_style="green"))
     
     # Sections
-    sections = brief_data.get('sections', [])
+    sections = safe_get_attr(brief_data, 'sections', [])
     if sections:
-        console.print(f"\n[bold blue]Research Sections ({len(sections)}):[/bold blue]")
+        rprint("\n[bold blue]📚 Research Sections:[/bold blue]")
         for i, section in enumerate(sections, 1):
-            heading = section.get('heading', f'Section {i}')
-            content = section.get('content', 'No content')
-            console.print(f"\n[bold]{i}. {heading}[/bold]")
-            console.print(content[:200] + "..." if len(content) > 200 else content)
+            heading = safe_get_attr(section, 'heading', f'Section {i}')
+            content = safe_get_attr(section, 'content', 'No content available')
+            rprint(f"\n[bold]{i}. {heading}[/bold]")
+            rprint(content)
     
     # References
-    references = brief_data.get('references', [])
+    references = safe_get_attr(brief_data, 'references', [])
     if references:
-        console.print(f"\n[bold magenta]References ({len(references)} sources):[/bold magenta]")
-        for i, ref in enumerate(references[:5], 1):  # Show first 5
-            title = ref.get('title', 'Untitled')
-            url = ref.get('url', 'No URL')
-            console.print(f"  {i}. {title}")
-            console.print(f"     [dim]{url}[/dim]")
-        
-        if len(references) > 5:
-            console.print(f"     [dim]... and {len(references) - 5} more sources[/dim]")
+        rprint(f"\n[bold magenta]🔗 References ({len(references)} sources):[/bold magenta]")
+        for i, ref in enumerate(references, 1):
+            title = safe_get_attr(ref, 'title', "Untitled Source")
+            url = safe_get_attr(ref, 'url', "No URL")
+            rprint(f"  {i}. {title}")
+            rprint(f"     [dim]{url}[/dim]")
 
-def display_user_history(history: List[Dict], username: str):
-    """Display user's research history"""
-    if not history:
-        console.print(f"[dim]No research history found for {username}[/dim]")
-        return
+def display_execution_summary(final_state, session_id: str, follow_up: bool):
+    """Display execution summary and statistics with better error handling"""
+    rprint(f"\n[bold]📊 Execution Summary[/bold]")
+    rprint(f"Session ID: [dim]{session_id}[/dim]")
+    rprint(f"Type: {'Follow-up Research' if follow_up else 'Initial Research'}")
     
-    console.print(f"\n[bold blue]Research History for {username} ({len(history)} sessions)[/bold blue]")
-    
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Date", style="dim", width=12)
-    table.add_column("Topic", style="cyan", min_width=30)
-    table.add_column("Type", justify="center", width=10)
-    table.add_column("Depth", justify="center", width=5)
-    table.add_column("Time", justify="right", width=8)
-    
-    for session in history:
-        date = session['created_at'][:10]  # YYYY-MM-DD
-        topic = session['topic'][:40] + '...' if len(session['topic']) > 40 else session['topic']
-        session_type = "Follow-up" if session.get('is_follow_up') else "Initial"
-        depth = str(session.get('depth', 'N/A'))
-        exec_time = f"{session.get('execution_time', 0):.1f}s" if session.get('execution_time') else 'N/A'
+    # Show processing steps
+    plan = final_state.get('plan') if isinstance(final_state, dict) else getattr(final_state, 'plan', None)
+    if plan:
+        steps = None
+        if isinstance(plan, dict):
+            steps = plan.get('steps')
+        elif hasattr(plan, 'steps'):
+            steps = plan.steps
         
-        table.add_row(date, topic, session_type, depth, exec_time)
+        if steps:
+            rprint(f"Research Steps: {len(steps)}")
     
-    console.print(table)
-
-def get_or_create_user() -> tuple[str, str]:
-    """Get existing user or create new one"""
-    db = ResearchDatabase()
+    source_summaries = final_state.get('source_summaries') if isinstance(final_state, dict) else getattr(final_state, 'source_summaries', None)
+    if source_summaries:
+        rprint(f"Sources Processed: {len(source_summaries)}")
     
-    # Check if user config exists
-    if os.path.exists(USER_CONFIG_FILE):
+    # Show any errors or warnings
+    errors = final_state.get('errors', []) if isinstance(final_state, dict) else getattr(final_state, 'errors', [])
+    if errors:
+        rprint(f"[yellow]⚠️ Issues encountered: {len(errors)}[/yellow]")
+        for error in errors:
+            rprint(f"  • [dim]{error}[/dim]")
+    
+    # Check for history save issues specifically
+    if any('session_id' in str(error).lower() or 'history' in str(error).lower() for error in errors):
+        rprint(f"[red]🔧 History Save Issue Detected[/red]")
+        rprint("  • This might be due to missing session_id in the graph state")
+        rprint("  • Check that your graph properly passes through session metadata")
+        
+    if not errors:
+        rprint("[green]✅ Research completed successfully![/green]")
+    
+    # Display final brief summary if available
+    brief = final_state.get('final_brief') if isinstance(final_state, dict) else getattr(final_state, 'final_brief', None)
+    if brief:
         try:
-            with open(USER_CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-            username = config.get('username')
-            user_id = config.get('user_id')
+            # Safe attribute access with multiple fallbacks
+            def get_brief_attr(attr, default='Unknown'):
+                if isinstance(brief, dict):
+                    return brief.get(attr, default)
+                elif hasattr(brief, attr):
+                    return getattr(brief, attr, default)
+                else:
+                    return default
             
-            if username and user_id:
-                use_existing = Confirm.ask(f"Continue as user '{username}'?", default=True)
-                if use_existing:
-                    db.update_last_active(user_id)
-                    return user_id, username
-        except (json.JSONDecodeError, KeyError):
-            pass
-    
-    # Show existing users
-    users = db.get_all_users()
-    if users:
-        console.print("\n[bold blue]Existing Users:[/bold blue]")
-        user_table = Table()
-        user_table.add_column("Username", style="cyan")
-        user_table.add_column("Research Count", justify="center")
-        user_table.add_column("Last Active", style="dim")
+            topic = get_brief_attr('topic')
+            sections = get_brief_attr('sections', [])
+            references = get_brief_attr('references', [])
+            audience = get_brief_attr('audience')
+            depth = get_brief_attr('depth')
+            
+            sections_count = len(sections) if sections else 0
+            refs_count = len(references) if references else 0
+            
+            rprint(f"\n[bold blue]📋 Final Brief Summary:[/bold blue]")
+            rprint(f"  Topic: {topic}")
+            rprint(f"  Sections: {sections_count}")
+            rprint(f"  References: {refs_count}")
+            rprint(f"  Audience: {audience}")
+            rprint(f"  Depth: {depth}")
+            rprint(f"  Follow-up: {follow_up}")
+            rprint(f"  Session ID: {session_id[:8]}..." if session_id else "N/A")
+            
+        except Exception as e:
+            rprint(f"[yellow]Could not parse brief summary: {e}[/yellow]")
+
+def save_research_results(brief_json, save_path, topic):
+    """Save research results with enhanced file handling and JSON serialization"""
+    try:
+        if os.path.isdir(save_path):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_topic = "".join(c for c in topic if c.isalnum() or c in " -_").strip()
+            save_path = os.path.join(save_path, f"{safe_topic}_{timestamp}.json")
+        elif not save_path.lower().endswith(".json"):
+            save_path += ".json"
         
-        for user in users[:10]:  # Show first 10 users
-            user_table.add_row(
-                user['username'],
-                str(user['research_count']),
-                user['last_active'][:10]
-            )
-        console.print(user_table)
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        
+        # Use safe JSON dump with serialization handling
+        success, error = safe_json_dump(brief_json, save_path)
+        
+        if success:
+            rprint(f"[green]💾 Research brief saved to:[/green] {save_path}")
+        else:
+            rprint(f"[red]Error saving file: {error}[/red]")
+            rprint("[yellow]Attempting fallback save with string conversion...[/yellow]")
+            
+            # Fallback: convert everything to strings
+            fallback_data = convert_to_json_serializable(brief_json)
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(fallback_data, f, ensure_ascii=False, indent=2, default=str)
+            rprint(f"[green]💾 Fallback save successful:[/green] {save_path}")
+        
+    except Exception as e:
+        rprint(f"[red]Critical error saving file: {e}[/red]")
+        rprint("[yellow]Saving as text file instead...[/yellow]")
+        
+        # Last resort: save as text
+        text_path = save_path.replace('.json', '.txt')
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(f"Research Brief - {topic}\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(str(brief_json))
+        
+        rprint(f"[green]💾 Saved as text file:[/green] {text_path}")
+
+def ensure_session_metadata(state: dict, final_state) -> dict:
+    """Ensure all required session metadata is present in final_state"""
+    required_keys = ['session_id', 'user_id', 'topic', 'depth', 'audience', 'follow_up']
     
-    # Get username
-    username = Prompt.ask("\nEnter username (or create new)", default="researcher").strip()
-    
-    # Check if user exists
-    user = db.get_user(username)
-    if user:
-        console.print(f"[green]Welcome back, {username}![/green]")
-        user_id = user['id']
-        db.update_last_active(user_id)
+    if isinstance(final_state, dict):
+        # final_state is a dictionary
+        for key in required_keys:
+            if key not in final_state and key in state:
+                final_state[key] = state[key]
+                rprint(f"[green]🔧 Added missing {key} to final_state[/green]")
     else:
-        # Create new user
-        user_id = db.create_user(username)
-        console.print(f"[green]New user '{username}' created![/green]")
+        # final_state is an object, convert to dict
+        final_state_dict = {}
+        
+        # Copy existing attributes/properties
+        if hasattr(final_state, '__dict__'):
+            final_state_dict.update(final_state.__dict__)
+        
+        # Add missing required keys
+        for key in required_keys:
+            if key not in final_state_dict and key in state:
+                final_state_dict[key] = state[key]
+                rprint(f"[green]🔧 Added missing {key} to final_state[/green]")
+        
+        return final_state_dict
     
-    # Save user config
-    with open(USER_CONFIG_FILE, 'w') as f:
-        json.dump({'username': username, 'user_id': user_id}, f)
+    return final_state
+
+# Enhanced chatbot function with all fixes
+def chatbot():
+    """Enhanced chatbot with context-aware research capabilities and error fixes"""
+    rprint(Panel.fit("[bold green]Welcome to Context-Aware Research Brief Chatbot[/bold green]"))
+    rprint("[dim]Now supports follow-up research building on previous conversations![/dim]\n")
+
+    # 1️⃣ Get or create user ID
+    user_id = get_or_create_user_id()
     
-    return user_id, username
+    # 2️⃣ Show user's research history (if any)
+    show_user_history(user_id)
+    
+    # 3️⃣ Gather inputs with context awareness
+    topic = input("\n📝 Enter research topic: ").strip() or "AI in Healthcare"
+    
+    # Ask if this is a follow-up to previous research
+    follow_up = False
+    history_store = get_history_store()
+    user_history = history_store.get_user_history(user_id, limit=5)
+    
+    if user_history:
+        rprint(f"\n[yellow]You have {len(user_history)} previous research sessions.[/yellow]")
+        follow_up = Confirm.ask("Is this a follow-up to your previous research?", default=False)
+        
+        if follow_up:
+            rprint("[green]✓ This research will build upon your previous work![/green]")
+    
+    # Other inputs
+    depth_input = input("Enter research depth (1–5, default=2): ").strip()
+    depth = int(depth_input) if depth_input.isdigit() and 1 <= int(depth_input) <= 5 else 2
+    audience = input("Enter target audience (default='general'): ").strip() or "general"
+    
+    # File save options
+    save_path = input("Optional: Enter path to save JSON (press Enter to skip): ").strip() or None
+
+    # 3️⃣ Generate session IDs and determine parent session
+    session_id = str(uuid.uuid4())
+    parent_session_id = None
+    
+    if follow_up and user_history:
+        # Use the most recent session as parent
+        parent_session_id = user_history[0].id if hasattr(user_history[0], 'id') else None
+        if parent_session_id:
+            rprint(f"[dim]🔗 Building on session: {parent_session_id[:8]}...[/dim]")
+
+    # 4️⃣ Initialize enhanced graph state with all required metadata
+    try:
+        # Create comprehensive initial state with all session metadata
+        state = {
+            "topic": topic,
+            "depth": depth,
+            "audience": audience,
+            "follow_up": follow_up,
+            "user_id": user_id,
+            "session_id": session_id,
+            "parent_session_id": parent_session_id,
+            # Additional metadata for robust state management
+            "created_at": datetime.now().isoformat(),
+            "session_type": "follow_up" if follow_up else "initial",
+            "is_follow_up": follow_up  # Alternative key name for compatibility
+        }
+        
+        # Validate critical session data is present
+        required_fields = ["session_id", "user_id", "topic"]
+        missing_fields = [field for field in required_fields if not state.get(field)]
+        
+        if missing_fields:
+            rprint(f"[red]❌ Critical fields missing: {missing_fields}[/red]")
+            return
+        
+        rprint(f"\n[cyan]🚀 Starting {'context-aware' if follow_up else 'new'} research...[/cyan]")
+        rprint(f"[dim]Session ID: {session_id[:8]}... | User: {user_id[:8]}...[/dim]")
+        
+    except Exception as e:
+        rprint(f"[red]Error initializing state:[/red] {str(e)}")
+        return
+
+    try:
+        # 5️⃣ Execute the context-aware graph
+        rprint("[yellow]📊 Compiling graph...[/yellow]")
+        compiled_graph = graph.compile()
+        
+        rprint("[yellow]🔄 Executing research workflow...[/yellow]")
+        final_state = compiled_graph.invoke(state)
+
+        # 🔧 CRITICAL FIX: Ensure session metadata is preserved
+        final_state = ensure_session_metadata(state, final_state)
+        
+        # Debug the final state
+        debug_session_state(state, final_state)
+
+        # 6️⃣ Display context information (if follow-up)
+        context_summary = final_state.get('context_summary') if isinstance(final_state, dict) else getattr(final_state, 'context_summary', None)
+        if follow_up and context_summary:
+            display_context_summary(context_summary)
+
+        # 7️⃣ Display final brief
+        rprint(Panel.fit(f"[bold cyan]📋 Research Brief: '{topic}'[/bold cyan]"))
+        
+        # Handle different possible return formats
+        brief_data = None
+        if isinstance(final_state, dict) and 'final_brief' in final_state:
+            brief_data = final_state['final_brief']
+        elif hasattr(final_state, 'final_brief'):
+            brief_data = final_state.final_brief
+        else:
+            brief_data = final_state
+        
+        # Display the brief with enhanced formatting
+        if brief_data:
+            if hasattr(brief_data, 'model_dump'):
+                display_enhanced_brief(brief_data)
+                # Handle JSON serialization with proper conversion
+                try:
+                    brief_json = brief_data.model_dump(mode="json")
+                except Exception as e:
+                    rprint(f"[yellow]⚠️ JSON serialization issue, attempting manual conversion: {e}[/yellow]")
+                    brief_json = convert_to_json_serializable(brief_data)
+            else:
+                display_enhanced_brief(brief_data)
+                brief_json = convert_to_json_serializable(brief_data)
+        else:
+            rprint("[red]No final brief generated[/red]")
+            return
+
+        # 8️⃣ Show execution summary
+        display_execution_summary(final_state, session_id, follow_up)
+
+        # 9️⃣ Save to file if requested
+        if save_path:
+            save_research_results(brief_json, save_path, topic)
+
+        # 🔟 Ask for follow-up research
+        ask_for_follow_up_research(user_id)
+
+    except Exception as e:
+        rprint(f"[red]❌ Error executing graph:[/red] {str(e)}")
+        rprint("[yellow]Please check your graph implementation and ensure it's properly configured.[/yellow]")
+        
+        # Debug information
+        rprint(f"[dim]Graph type: {type(graph)}[/dim]")
+
+def display_context_summary(context_summary):
+    """Display the context summary in a nice format"""
+    rprint("\n[bold yellow]📋 Context from Previous Research[/bold yellow]")
+    
+    # Safe attribute access
+    def safe_get(obj, attr, default=None):
+        if isinstance(obj, dict):
+            return obj.get(attr, default)
+        else:
+            return getattr(obj, attr, default)
+    
+    previous_topics = safe_get(context_summary, 'previous_topics', [])
+    if previous_topics:
+        rprint("[blue]Previous Topics:[/blue]")
+        for topic in previous_topics:
+            rprint(f"  • {topic}")
+    
+    key_findings = safe_get(context_summary, 'key_findings', [])
+    if key_findings:
+        rprint("\n[green]Key Findings to Build Upon:[/green]")
+        for finding in key_findings[:5]:  # Show top 5
+            rprint(f"  • {finding}")
+    
+    knowledge_gaps = safe_get(context_summary, 'knowledge_gaps', [])
+    if knowledge_gaps:
+        rprint("\n[red]Knowledge Gaps to Address:[/red]")
+        for gap in knowledge_gaps:
+            rprint(f"  • {gap}")
+    
+    rprint()
+
+def ask_for_follow_up_research(user_id: str):
+    """Ask user if they want to do follow-up research"""
+    rprint("\n" + "="*50)
+    
+    continue_research = Confirm.ask("Would you like to conduct follow-up research on a related topic?", default=False)
+    
+    if continue_research:
+        rprint("[green]🔄 Starting follow-up research...[/green]")
+        rprint("="*50)
+        # Recursively call chatbot for follow-up research
+        chatbot()
+    else:
+        rprint("[blue]Thank you for using the Context-Aware Research Assistant![/blue]")
+        rprint("[dim]Your research history has been saved for future sessions.[/dim]")
 
 def main():
-    """Main CLI function"""
-    console.print(Panel.fit("[bold green]Context-Aware Research CLI Tool[/bold green]"))
-    console.print("[dim]Connected to your deployed Render API[/dim]\n")
-    
-    # Initialize
-    api_client = APIClient(API_BASE_URL)
-    db = ResearchDatabase()
-    
-    # Check API health
-    console.print("[yellow]Checking API connection...[/yellow]")
-    if not api_client.check_health():
-        console.print(f"[red]❌ Cannot connect to API at {API_BASE_URL}[/red]")
-        console.print("[yellow]Please check your API URL and ensure the service is running[/yellow]")
-        return
-    
-    console.print("[green]✅ API connection successful[/green]")
+    """Main function to choose between different modes"""
+    rprint(Panel.fit("[bold green]Context-Aware Research Assistant[/bold green]"))
+    rprint("[dim]Choose your research mode:[/dim]\n")
     
     try:
-        while True:
-            # Get user
-            user_id, username = get_or_create_user()
-            
-            # Show recent history
-            history = db.get_user_history(user_id, limit=5)
-            if history:
-                display_user_history(history, username)
-            
-            # Get research parameters
-            console.print(f"\n[bold cyan]New Research Session for {username}[/bold cyan]")
-            
-            topic = Prompt.ask("Research topic", default="AI in Healthcare").strip()
-            
-            # Check for follow-up
-            follow_up = False
-            parent_session_id = None
-            if history:
-                follow_up = Confirm.ask(f"Build on previous research? (You have {len(history)} sessions)", default=False)
-                if follow_up:
-                    parent_session_id = history[0]['session_id']  # Use most recent
-                    console.print(f"[green]Building on: {history[0]['topic']}[/green]")
-            
-            depth = int(Prompt.ask("Research depth (1-5)", default="2", choices=["1", "2", "3", "4", "5"]))
-            audience = Prompt.ask("Target audience", default="general").strip()
-            
-            # Prepare API request
-            request_data = {
-                "topic": topic,
-                "depth": depth,
-                "audience": audience,
-                "follow_up": follow_up,
-                "user_id": user_id,
-                "parent_session_id": parent_session_id
-            }
-            
-            # Generate research brief
-            console.print(f"\n[yellow]🔍 Generating research brief...[/yellow]")
-            
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
-                task = progress.add_task("Processing research request...", total=None)
-                
-                try:
-                    response = api_client.generate_research_brief(request_data)
-                    progress.update(task, description="Research completed!")
-                    
-                except Exception as e:
-                    console.print(f"[red]❌ Error: {e}[/red]")
-                    continue
-            
-            # Display results
-            console.print("\n" + "="*60)
-            display_research_brief(response)
-            
-            # Save files
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_topic = "".join(c for c in topic if c.isalnum() or c in " -_").strip()[:30]
-            
-            # Save JSON
-            json_filename = f"{username}_{safe_topic}_{timestamp}.json"
-            json_path = save_json_output(response, json_filename)
-            console.print(f"\n[green]💾 JSON saved to: {json_path}[/green]")
-            
-            # Ask for PDF format preference
-            console.print("\n[bold cyan]PDF Generation Options:[/bold cyan]")
-            console.print("1. Brief Summary (5-10 pages)")
-            console.print("2. Full Research Paper (15-25 pages)")
-            console.print("3. Both formats")
-            console.print("4. Skip PDF generation")
-            
-            pdf_choice = Prompt.ask("Choose PDF format", choices=["1", "2", "3", "4"], default="2")
-            
-            pdf_paths = []
-            try:
-                if pdf_choice in ["1", "3"]:  # Brief summary
-                    brief_filename = json_filename.replace('.json', '_brief.pdf')
-                    brief_path = generate_brief_summary(response, f"research_outputs/{brief_filename}")
-                    pdf_paths.append(brief_path)
-                    console.print(f"[green]📄 Brief summary saved to: {brief_path}[/green]")
-                
-                if pdf_choice in ["2", "3"]:  # Full research paper
-                    paper_filename = json_filename.replace('.json', '_research_paper.pdf')
-                    paper_path = generate_research_paper(response, f"research_outputs/{paper_filename}")
-                    pdf_paths.append(paper_path)
-                    console.print(f"[green]📄 Research paper saved to: {paper_path}[/green]")
-                
-                pdf_path = pdf_paths[0] if pdf_paths else None
-                
-            except Exception as e:
-                console.print(f"[yellow]⚠️ PDF generation failed: {e}[/yellow]")
-                pdf_path = None
-            
-            # Save to database
-            session_data = {
-                'session_id': response['session_id'],
-                'user_id': user_id,
-                'username': username,
-                'topic': topic,
-                'depth': depth,
-                'audience': audience,
-                'is_follow_up': follow_up,
-                'parent_session_id': parent_session_id,
-                'execution_time': response.get('execution_time_seconds'),
-                'json_file_path': json_path,
-                'pdf_file_path': pdf_path,
-                'api_response': response
-            }
-            
-            db.save_research_session(session_data)
-            console.print("[green]✅ Session saved to database[/green]")
-            
-            # Ask for another research
-            console.print("\n" + "="*60)
-            if not Confirm.ask("Conduct another research?", default=True):
-                break
-    
+        chatbot()
     except KeyboardInterrupt:
-        console.print("\n[yellow]Session interrupted by user[/yellow]")
+        rprint("\n[yellow]Session interrupted by user[/yellow]")
     except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-    
-    console.print("[blue]Thank you for using the Research CLI Tool![/blue]")
+        rprint(f"[red]Error: {e}[/red]")
 
 if __name__ == "__main__":
     main()
