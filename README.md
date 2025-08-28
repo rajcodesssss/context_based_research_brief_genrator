@@ -67,7 +67,7 @@ graph TD
    - **Configuration**: Temperature 0.1, max_tokens 1024
 
 ### Tool Integration
-- **LangChain Web Search Tool**: DuckDuckGo search integration for reliable web queries
+- **LangChain Web Search Tool**: Serper search integration for reliable web queries
 - **LangChain Document Loader**: Handles various content types (HTML, PDF, text)
 - **Custom Validators**: Pydantic-based schema enforcement with automatic retries
 
@@ -80,41 +80,80 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 
+class ContextSummary(BaseModel):
+    """Summary of previous research context"""
+    previous_topics: List[str] = Field(default_factory=list)
+    key_findings: List[str] = Field(default_factory=list)
+    knowledge_gaps: List[str] = Field(default_factory=list)
+    related_areas: List[str] = Field(default_factory=list)
+    last_updated: datetime = Field(default_factory=datetime.utcnow)
+
+class ResearchRequest(BaseModel):
+    """Enhanced request with context awareness"""
+    topic: str
+    depth: int = Field(default=2, ge=1, le=5)
+    audience: str = "general"
+    follow_up: bool = False
+    user_id: str = "default_user"
+    session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+
+class ResearchPlanStep(BaseModel):
+    order: PositiveInt
+    objective: str
+    method: str
+    expected_output: str
+
 class ResearchPlan(BaseModel):
-    """Structured research planning output"""
-    topic: str = Field(..., description="Research topic")
-    subtopics: List[str] = Field(..., min_items=2, max_items=8)
-    search_queries: List[str] = Field(..., min_items=3, max_items=10)
-    depth_level: int = Field(..., ge=1, le=5)
-    estimated_sources: int = Field(..., ge=3, le=20)
+    topic: str
+    depth: int = Field(1, ge=1, le=5)
+    steps: List[ResearchPlanStep]
+    # New field for context-aware planning
+    builds_on_previous: bool = False
+    context_notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def ensure_steps_are_ordered(self):
+        if [s.order for s in self.steps] != sorted([s.order for s in self.steps]):
+            raise ValueError("ResearchPlan.steps must be ordered")
+        return self
 
 class SourceSummary(BaseModel):
-    """Individual source summarization"""
-    url: str = Field(..., description="Source URL")
-    title: str = Field(..., max_length=200)
-    summary: str = Field(..., min_length=100, max_length=1000)
-    key_points: List[str] = Field(..., min_items=2, max_items=6)
-    credibility_score: float = Field(..., ge=0.0, le=1.0)
-    relevance_score: float = Field(..., ge=0.0, le=1.0)
+    source_id: str
+    url: Optional[HttpUrl] = None
+    title: Optional[str] = None
+    key_points: List[str] = Field(default_factory=list)
+    credibility_notes: Optional[str] = None
+    extracted_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        json_encoders = {
+            HttpUrl: str,
+            datetime: lambda v: v.isoformat(),
+        }
+
+
+class FinalBriefReference(BaseModel):
+    source_id: str
+    url: Optional[HttpUrl] = None
+    title: Optional[str] = None
+
+class FinalBriefSection(BaseModel):
+    heading: str
+    content: str
 
 class FinalBrief(BaseModel):
-    """Complete research brief output"""
     topic: str
-    executive_summary: str = Field(..., min_length=200, max_length=500)
-    key_findings: List[str] = Field(..., min_items=3, max_items=10)
-    detailed_analysis: str = Field(..., min_length=500, max_length=2000)
-    evidence_links: List[SourceSummary] = Field(..., min_items=3)
-    confidence_score: float = Field(..., ge=0.0, le=1.0)
-    limitations: List[str] = Field(default_factory=list)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class ContextSummary(BaseModel):
-    """User interaction history summary"""
-    user_id: str
-    previous_topics: List[str] = Field(..., max_items=10)
-    research_patterns: List[str] = Field(default_factory=list)
-    key_insights: List[str] = Field(default_factory=list)
-    last_interaction: datetime
+    audience: str = "general"
+    depth: int = Field(1, ge=1, le=5)
+    thesis: str
+    sections: List[FinalBriefSection]
+    references: List[FinalBriefReference]
+    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    # New fields for context tracking
+    session_id: Optional[str] = None
+    is_follow_up: bool = False
+    parent_session_id: Optional[str] = None
 ```
 
 ### Validation Strategy
@@ -195,6 +234,7 @@ curl -X POST "https://context-based-research-brief-genrator.onrender.com/brief" 
 # API Keys
 GROK_API_KEY=your_grok_api_key
 MISTRAL_API_KEY=your_mistral_api_key
+SERPER_API_KEY=your_serper_api_key
 
 # LangSmith Configuration
 LANGCHAIN_TRACING_V2=true
@@ -366,50 +406,6 @@ research-brief --topic "electric vehicles market" --output ev_research.json --fo
 
 ## 📊 Visual Documentation & Tracing
 
-### LangGraph Architecture Visualization
-
-![LangGraph Complete Workflow](docs/images/langgraph-complete-flow.png)
-
-*Complete LangGraph workflow showing all nodes, edges, and conditional logic*
-
-#### Node Execution Flow
-![Node Execution Timeline](docs/images/node-execution-timeline.png)
-
-*Timeline view of node execution with parallel processing and retry mechanisms*
-
-#### State Management Visualization  
-![State Management Flow](docs/images/state-management.png)
-
-*Visual representation of how state flows through the graph with checkpointing*
-
-### LangSmith Tracing Examples
-
-#### Successful Execution Trace
-![Successful Trace](docs/images/langsmith-success-trace.png)
-🔗 **View Live**: [Complete Research Brief Generation](https://smith.langchain.com/public/success-trace-example)
-
-*Shows full workflow execution from context check to final brief generation (45.2s total)*
-
-#### Follow-up Query Trace
-![Follow-up Trace](docs/images/langsmith-followup-trace.png)
-🔗 **View Live**: [Context-Aware Follow-up Query](https://smith.langchain.com/public/followup-trace-example)
-
-*Demonstrates context summarization and integration into new research (28.7s total)*
-
-#### Error Recovery Trace
-![Error Recovery Trace](docs/images/langsmith-error-trace.png)
-🔗 **View Live**: [Retry Logic and Error Handling](https://smith.langchain.com/public/error-recovery-trace)
-
-*Shows automatic retry mechanism when schema validation fails (52.1s with 2 retries)*
-
-#### Performance Analytics Dashboard
-![Performance Dashboard](docs/images/langsmith-performance-dashboard.png)
-
-*LangSmith analytics showing token usage, latency distribution, and success rates*
-
-### Token Usage Breakdown
-![Token Usage Chart](docs/images/token-usage-breakdown.png)
-
 *Detailed breakdown of token consumption across different nodes and models*
 
 ### How to Generate Your Own Visualizations
@@ -424,12 +420,6 @@ workflow = create_research_workflow()
 workflow.get_graph().draw_mermaid_png(output_file_path="docs/images/workflow.png")
 ```
 
-#### Export LangSmith Traces
-1. Navigate to your [LangSmith Project](https://smith.langchain.com/projects/context-based-research-brief-genrator)
-2. Select a trace from successful execution
-3. Click "Share" → "Make Public" → Copy link
-4. Take screenshot of trace visualization
-5. Add both link and screenshot to documentation
 
 #### Performance Metrics Export
 ```python
@@ -441,26 +431,11 @@ runs = client.list_runs(project_name="context-based-research-brief-genrator")
 # Generate charts and save to docs/images/
 ```
 
-### Image Assets Directory Structure
-```
-docs/
-├── images/
-│   ├── langgraph-complete-flow.png        # Main workflow diagram
-│   ├── node-execution-timeline.png        # Execution timeline
-│   ├── state-management.png               # State flow diagram
-│   ├── langsmith-success-trace.png        # Successful execution
-│   ├── langsmith-followup-trace.png       # Follow-up query
-│   ├── langsmith-error-trace.png          # Error recovery
-│   ├── langsmith-performance-dashboard.png # Analytics dashboard
-│   ├── token-usage-breakdown.png          # Token consumption
-│   └── README.md                          # Image documentation
-```
 
----
 
 ### LangSmith Integration
 
-**Trace Dashboard**: [View Live Traces](https://smith.langchain.com/projects/research-brief-generator)
+
 
 #### Key Metrics Tracked:
 - **Graph Execution Time**: End-to-end workflow duration
@@ -469,22 +444,15 @@ docs/
 - **Error Rates**: Validation failures and retry attempts
 - **User Patterns**: Query types and follow-up frequencies
 
-### Sample Trace Screenshot
-![LangSmith Trace Example](docs/images/langsmith-trace.png)
+### Graph Visualization Example
+![Graph architecture flow chart](docs/diagrams/research_graph_structure.png)
+### Follow-up Trace Example
+![Follow-up Trace](docs/images/followup-trace.png.png)
 
-*Example trace showing successful research brief generation with 7-step workflow execution*
-
-### LangGraph Workflow Visualization
-![LangGraph Workflow](docs/images/langgraph-workflow.png)
+### Token Usage Breakdown
+![Token Usage Chart](docs/images/token-usage-breakdown.png)
 
 *Visual representation of the complete research brief generation workflow with node dependencies and state transitions*
-
-### Interactive Trace Dashboard
-🔗 **Live Trace Examples**: 
-- [Basic Research Brief Generation](https://smith.langchain.com/public/your-trace-id-1)
-- [Follow-up Query with Context](https://smith.langchain.com/public/your-trace-id-2)
-- [Error Recovery Example](https://smith.langchain.com/public/your-trace-id-3)
-
 ### Monitoring Stack
 - **LangSmith**: Primary tracing and observability
 - **Application Logs**: Structured logging with correlation IDs
@@ -614,45 +582,33 @@ make build
 
 ### Project Structure
 ```
-research-brief-generator/
-├── app/
-│   ├── __init__.py
-│   ├── main.py                 # FastAPI application
-│   ├── cli.py                  # Command-line interface
-│   ├── graph/
-│   │   ├── __init__.py
-│   │   ├── workflow.py         # LangGraph definition
-│   │   ├── nodes.py            # Individual graph nodes
-│   │   └── state.py            # Graph state management
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── schemas.py          # Pydantic models
-│   │   └── llm_config.py       # LLM configurations
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── context_service.py  # Context management
-│   │   ├── search_service.py   # Web search integration
-│   │   └── synthesis_service.py # Evidence synthesis
-│   └── utils/
-│       ├── __init__.py
-│       ├── validators.py       # Schema validation
-│       └── helpers.py          # Utility functions
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── e2e/
-├── docs/
-│   ├── api.md
-│   ├── deployment.md
-│   └── images/
-├── requirements.txt
-├── requirements-dev.txt
-├── .env.example
-├── .gitignore
-├── LICENSE
-├── CONTRIBUTING.md
-├── Makefile
-└── README.md
+project-root/
+│
+├── llm/                         # Possibly code/models related to large language models
+├── tools/                       # Utility scripts/tools
+├── test/                        # Testing-related files
+│
+├── .env.example                 # Example environment config
+├── .gitignore                   # Git ignore rules
+├── README.md                    # Project readme
+├── requirements.txt             # Python dependencies
+│
+├── api.py                       # API-related code
+├── chatbot.py                   # CLI / chatbot logic
+├── debug.py                     # Debugging utilities
+├── forme.txt                    # Text file (maybe test or placeholder)
+├── graphs.py                    # Graph-related code
+├── main.py                      # Main entry point
+├── models.py                    # Model definitions / data structures
+├── pdf_converter.py             # PDF conversion logic
+├── storage.py                   # Storage / DB handling
+├── testing.py                   # Test script
+├── test_open.py                 # Specific test script
+├── test_search.py               # Another test script
+├── user_config.json             # User configuration
+├── visualize.py                 # Visualization script
+└── research_graph_structure.png # Visual representation of research graph
+
 ```
 
 ## 🚦 Limitations and Areas for Improvement
@@ -773,4 +729,3 @@ curl -X POST "http://localhost:8000/brief" \
 
 ---
 
-*Last Updated: January 2024*
