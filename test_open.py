@@ -3,7 +3,7 @@ import os
 
 def main():
     # Create client (reads OPENAI_API_KEY from env automatically)
-    client = OpenAI(api_key="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")
+    client = OpenAI(api_key="youtr open ai keys")
 
     # Simple prompt test
     response = client.chat.completions.create(
